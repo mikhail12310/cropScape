@@ -1,8 +1,11 @@
 import os
 import time
+import rasterio
+import numpy as np
 from datetime import date, timedelta
 import re
 import requests
+from rasterio.warp import reproject, Resampling
 
 
 # ✓ Iowa was the only one correct — all others recomputed from WGS84 → EPSG:5070
@@ -443,3 +446,295 @@ def download_smap_growing_season(year, out_dir="smap_weekly",
     print(f"\nDone — {len(downloaded)}/{len(weeks)} files downloaded.")
     return downloaded
 
+
+# ============================================================================
+# Task 4 Lightweight Helper Functions
+# ============================================================================
+
+def download_smap_anomaly(date_str, output_file, bbox=None, crs="http://www.opengis.net/def/crs/EPSG/0/5070"):
+    """
+    Download SMAP L4 soil moisture anomaly data for a specific date.
+    
+    Parameters
+    ----------
+    date_str : str
+        Date string in format YYYY.MM.DD
+    output_file : str
+        Path to save the downloaded TIFF file
+    bbox : str
+        Bounding box string in format "xmin,ymin,xmax,ymax"
+    crs : str
+        Coordinate reference system URL
+    
+    Returns
+    -------
+    bool
+        True if download succeeded, False otherwise
+    """
+    year = date_str.split('.')[0]
+    url = "https://cloud.csiss.gmu.edu/smap_server/cgi-bin/mapserv"
+    params = {
+        'SERVICE': 'WCS',
+        'VERSION': '2.0.1',
+        'REQUEST': 'GetCoverage',
+        'MAP': f'/WMS/SMAP-9KM-ANOMALY-DAILY-SUB_{year}.map',
+        'COVERAGEID': f'SMAP-9KM-ANOMALY-DAILY-SUB_{date_str}',
+        'FORMAT': 'image/tiff',
+        'SUBSET': [f'x({bbox.split(",")[0]},{bbox.split(",")[2]})', 
+                   f'y({bbox.split(",")[1]},{bbox.split(",")[3]})'],
+        'SUBSETTINGCRS': crs
+    }
+    
+    print(f"Downloading SMAP Anomaly for {date_str}...")
+    r = requests.get(url, params=params, timeout=60)
+    if r.status_code == 200:
+        with open(output_file, 'wb') as f:
+            f.write(r.content)
+        print(f"  Saved to {output_file}")
+        return True
+    else:
+        print(f"  Error: {r.status_code}")
+        print(r.text[:500])
+        return False
+
+def task4_build_ndvi_lightweight_stack(year, state_name, cdl_profile, out_dir="ndvi_data_task4"):
+    """
+    Lightweight NDVI stack for Task 4: download only 3 weekly layers per year.
+    
+    Downloads exactly 3 representative weekly NDVI layers:
+    - Early: One April week (week ~15)
+    - Peak: One July week (week ~28)
+    - Late: One September week (week ~37)
+    
+    Returns a 3-band stack (early, peak, late) aligned to CDL grid.
+    
+    Parameters
+    ----------
+    year : int
+        Year to download for
+    state_name : str
+        State name for file naming
+    cdl_profile : dict
+        CDL raster profile for reprojection
+    out_dir : str
+        Output directory for downloaded files
+    
+    Returns
+    -------
+    numpy.ndarray
+        3-band stack with shape (3, height, width)
+        Band 0: early season (April)
+        Band 1: peak season (July)
+        Band 2: late season (September)
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Define 3 representative weeks (one per season)
+    early_week = 15   # April
+    peak_week = 28    # July
+    late_week = 37    # September
+    
+    weeks_to_download = [(year, early_week), (year, peak_week), (year, late_week)]
+    
+    bands = []
+    for iso_year, iso_week in weeks_to_download:
+        fname = f"{out_dir}/ndvi_task4_{state_name}_{iso_year}_w{iso_week:02d}.tif"
+        
+        # Download if not exists
+        if not os.path.exists(fname):
+            print(f"  Downloading NDVI week {iso_week} for {year}...")
+            ok = download_ndvi_weekly_tiff(iso_year, iso_week, fname)
+            if not ok:
+                print(f"    Failed to download week {iso_week}, using NaN")
+                bands.append(np.full((cdl_profile["height"], cdl_profile["width"]), np.nan))
+                continue
+        
+        # Load and reproject
+        try:
+            with rasterio.open(fname) as src:
+                ndvi_raw = src.read(1).astype(np.float32)
+                ndvi_profile = src.profile
+                nodata_val = src.nodata
+                
+                if nodata_val is not None:
+                    ndvi_raw[ndvi_raw == nodata_val] = np.nan
+                
+                # Scale uint8 -> float NDVI
+                ndvi_float = ndvi_raw / 125.0 - 1.0
+                ndvi_matched = reproject_to_match(ndvi_float, ndvi_profile, cdl_profile)
+                ndvi_matched[(ndvi_matched < -1) | (ndvi_matched > 1)] = np.nan
+                
+                bands.append(ndvi_matched)
+                print(f"    ✓ Loaded NDVI week {iso_week}")
+        except Exception as e:
+            print(f"    Error loading NDVI week {iso_week}: {e}")
+            bands.append(np.full((cdl_profile["height"], cdl_profile["width"]), np.nan))
+    
+    # Stack into 3-band array
+    stack = np.stack(bands)
+    
+    return stack
+
+
+def task4_build_smap_lightweight_stack(year, state_name, cdl_profile, bbox, out_dir="smap_data_task4"):
+    """
+    Lightweight SMAP stack for Task 4: download only 3 dates per year.
+    
+    Downloads exactly 3 representative SMAP anomaly dates:
+    - Early: April 15 (YYYY.04.15)
+    - Mid: July 15 (YYYY.07.15)
+    - Late: September 15 (YYYY.09.15)
+    
+    Returns a 3-band stack (early, mid, late) aligned to CDL grid.
+    
+    Parameters
+    ----------
+    year : int
+        Year to download for
+    state_name : str
+        State name for file naming
+    cdl_profile : dict
+        CDL raster profile for reprojection
+    bbox : str
+        Bounding box string in format "xmin,ymin,xmax,ymax"
+    out_dir : str
+        Output directory for downloaded files
+    
+    Returns
+    -------
+    numpy.ndarray
+        3-band stack with shape (3, height, width)
+        Band 0: early season (April 15)
+        Band 1: mid season (July 15)
+        Band 2: late season (September 15)
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Define 3 representative dates
+    dates_to_download = [
+        f"{year}.04.15",  # Early
+        f"{year}.07.15",  # Mid
+        f"{year}.09.15",  # Late
+    ]
+    
+    bands = []
+    for date_str in dates_to_download:
+        fname = f"{out_dir}/smap_task4_{state_name}_{date_str.replace('.', '')}.tif"
+        
+        # Download if not exists
+        if not os.path.exists(fname):
+            print(f"  Downloading SMAP for {date_str}...")
+            ok = download_smap_anomaly(date_str, fname, bbox=bbox)
+            if not ok:
+                print(f"    Failed to download {date_str}, using NaN")
+                bands.append(np.full((cdl_profile["height"], cdl_profile["width"]), np.nan))
+                continue
+        
+        # Load and reproject
+        try:
+            with rasterio.open(fname) as src:
+                sm_raw = src.read(1).astype(np.float32)
+                sm_profile = src.profile
+                nodata_val = src.nodata
+                
+                if nodata_val is not None:
+                    sm_raw[sm_raw == nodata_val] = np.nan
+                
+                sm_matched = reproject_to_match(sm_raw, sm_profile, cdl_profile)
+                
+                bands.append(sm_matched)
+                print(f"    ✓ Loaded SMAP for {date_str}")
+        except Exception as e:
+            print(f"    Error loading SMAP for {date_str}: {e}")
+            bands.append(np.full((cdl_profile["height"], cdl_profile["width"]), np.nan))
+    
+    # Stack into 3-band array
+    stack = np.stack(bands)
+    
+    return stack
+
+
+def task4_extract_ndvi_last_year(ndvi_stacks, target_year, rows, cols):
+    """
+    Extract NDVI features from the previous year (t-1) only for Task 4.
+    
+    Parameters
+    ----------
+    ndvi_stacks : dict
+        Dictionary mapping year to 3-band NDVI stack (early, peak, late)
+        Each stack shape: (3, height, width)
+    target_year : int
+        Target year (will use target_year - 1)
+    rows, cols : array-like
+        Pixel indices to extract values for
+    
+    Returns
+    -------
+    dict
+        Dictionary with last-year NDVI features:
+        - early_ndvi_last_year
+        - peak_ndvi_last_year
+        - late_ndvi_last_year
+    """
+    last_year = target_year - 1
+    
+    if last_year not in ndvi_stacks:
+        # Return NaN if last year data not available
+        return {
+            'early_ndvi_last_year': np.full(len(rows), np.nan),
+            'peak_ndvi_last_year': np.full(len(rows), np.nan),
+            'late_ndvi_last_year': np.full(len(rows), np.nan),
+        }
+    
+    stack = ndvi_stacks[last_year]
+    # stack shape: (3, height, width)
+    # band 0: early, band 1: peak, band 2: late
+    
+    return {
+        'early_ndvi_last_year': stack[0, rows, cols],
+        'peak_ndvi_last_year': stack[1, rows, cols],
+        'late_ndvi_last_year': stack[2, rows, cols],
+    }
+
+
+def task4_extract_smap_last_year(smap_stacks, target_year, rows, cols):
+    """
+    Extract SMAP features from the previous year (t-1) only for Task 4.
+    
+    Parameters
+    ----------
+    smap_stacks : dict
+        Dictionary mapping year to 3-band SMAP stack (early, mid, late)
+        Each stack shape: (3, height, width)
+    target_year : int
+        Target year (will use target_year - 1)
+    rows, cols : array-like
+        Pixel indices to extract values for
+    
+    Returns
+    -------
+    dict
+        Dictionary with last-year SMAP features:
+        - sm_early_last_year
+        - sm_mid_last_year
+        - sm_late_last_year
+    """
+    last_year = target_year - 1
+    
+    if last_year not in smap_stacks:
+        # Return NaN if last year data not available
+        return {
+            'sm_early_last_year': np.full(len(rows), np.nan),
+            'sm_mid_last_year': np.full(len(rows), np.nan),
+            'sm_late_last_year': np.full(len(rows), np.nan),
+        }
+    
+    stack = smap_stacks[last_year]
+    # stack shape: (3, height, width)
+    # band 0: early, band 1: mid, band 2: late
+    
+    return {
+        'sm_early_last_year': stack[0, rows, cols],
+        'sm_mid_last_year': stack[1, rows, cols],
+        'sm_late_last_year': stack[2, rows, cols],
+    }
